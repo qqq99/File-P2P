@@ -1,0 +1,751 @@
+package unimelb.bitbox;
+
+import unimelb.bitbox.util.Configuration;
+import unimelb.bitbox.util.Document;
+import unimelb.bitbox.util.FileSystemManager;
+import unimelb.bitbox.util.FileSystemManager.FileSystemEvent;
+import unimelb.bitbox.util.FileSystemObserver;
+
+import java.io.*;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.logging.Logger;
+
+public class ServerMain implements FileSystemObserver {
+    private static Logger log = Logger.getLogger(ServerMain.class.getName());
+    protected FileSystemManager fileSystemManager;
+    private List<Socket> peers;
+
+    public ServerMain() throws NumberFormatException, IOException, NoSuchAlgorithmException {
+        peers = new ArrayList<>();
+        // server thread
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    int serverPort = Integer.valueOf(Configuration.getConfigurationValue("port"));
+                    ServerSocket listenSocket = new ServerSocket(serverPort);
+                    while (true) {
+                        Socket clientSocket = listenSocket.accept();
+                        log.info("accept socket: " + clientSocket);
+                        // start connection thread
+                        new Connection(clientSocket);
+                    }
+                } catch (IOException e) {
+                    System.out.println("Listen socket:" + e.getMessage());
+                }
+            }
+        }).start();
+
+        // init peer connection
+        initPeerConnection();
+
+        fileSystemManager = new FileSystemManager(Configuration.getConfigurationValue("path"), this);
+
+        // time thread
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                int sleepTime = Integer.parseInt(Configuration.getConfigurationValue("syncInterval"));
+                while (true) {
+                    // sleep interval which in configuration
+                    try {
+                        Thread.sleep(sleepTime * 1000);
+                    } catch (InterruptedException e) {
+                        log.severe("Sleep interrupted: " + e.getMessage());
+                    }
+
+                    // begin sync events
+                    log.info("sync events begin!");
+                    for (FileSystemEvent pathevent : fileSystemManager.generateSyncEvents()) {
+                        log.info(pathevent.toString());
+                        processFileSystemEvent(pathevent);
+                    }
+                    log.info("sync events end!");
+                }
+            }
+        }).start();
+    }
+
+    @Override
+    public void processFileSystemEvent(FileSystemEvent fileSystemEvent) {
+        if (fileSystemEvent.event == FileSystemManager.EVENT.FILE_CREATE) {
+            buildFIleRequest(fileSystemEvent, "FILE_CREATE_REQUEST");
+        } else if (fileSystemEvent.event == FileSystemManager.EVENT.FILE_MODIFY) {
+            buildFIleRequest(fileSystemEvent, "FILE_MODIFY_REQUEST");
+        } else if (fileSystemEvent.event == FileSystemManager.EVENT.FILE_DELETE) {
+            buildFIleRequest(fileSystemEvent, "FILE_DELETE_REQUEST");
+        } else if (fileSystemEvent.event == FileSystemManager.EVENT.DIRECTORY_CREATE) {
+            buildDirectoryRequest(fileSystemEvent, "DIRECTORY_CREATE_REQUEST");
+        } else if (fileSystemEvent.event == FileSystemManager.EVENT.DIRECTORY_DELETE) {
+            buildDirectoryRequest(fileSystemEvent, "DIRECTORY_DELETE_REQUEST");
+        } else {
+            log.severe("Unsupported file event: " + fileSystemEvent.event.toString());
+        }
+        // TODO: process events
+    }
+
+    // build and send basic directory request which contains file descriptor and pathname
+    private void buildDirectoryRequest(FileSystemEvent fileSystemEvent, String commandType) {
+        // build request
+        Document request = new Document();
+        request.append("command", commandType);
+        request.append("pathName", fileSystemEvent.pathName);
+
+        // send request to all peers
+        sendDocumentToPeer(commandType, request);
+    }
+
+    // build and send basic file request which contains file descriptor and pathname
+    private void buildFIleRequest(FileSystemEvent fileSystemEvent, String commandType) {
+        // build request
+        Document request = new Document();
+        request.append("command", commandType);
+        Document descriptor = new Document();
+        descriptor.append("md5", fileSystemEvent.fileDescriptor.md5);
+        descriptor.append("lastModified", fileSystemEvent.fileDescriptor.lastModified);
+        descriptor.append("fileSize", fileSystemEvent.fileDescriptor.fileSize);
+        request.append("fileDescriptor", descriptor);
+        request.append("pathName", fileSystemEvent.pathName);
+
+        System.out.println(request.toJson());
+
+        // send request to all peers
+        sendDocumentToPeer(commandType, request);
+    }
+
+    // send a request document to all peers
+    private void sendDocumentToPeer(String commandType, Document request) {
+        for (Socket peer : peers) {
+            try {
+                BufferedWriter out = new BufferedWriter(new OutputStreamWriter(peer.getOutputStream(), "UTF8"));
+                out.write(request.toJson());
+                out.newLine();
+                out.flush();
+                log.info("send request to peer: "
+                        + peer.getInetAddress().getHostName() + ": " + peer.getPort() + " " + request.toJson());
+            } catch (IOException e) {
+                log.severe("can't write socket in " + commandType);
+            }
+        }
+    }
+
+    // use to init peer connection
+    @SuppressWarnings("unchecked")
+    private void initPeerConnection() {
+        // build handShake request
+        Document handShake = new Document();
+        handShake.append("command", "HANDSHAKE_REQUEST");
+        Document hostPort = new Document();
+        hostPort.append("host", Configuration.getConfigurationValue("advertisedName"));
+        hostPort.append("port", Integer.parseInt(Configuration.getConfigurationValue("port")));
+        handShake.append("hostPort", hostPort);
+
+        String[] peersAddr = Configuration.getConfigurationValue("peers").split(",");
+        for (String peerAddr : peersAddr) {
+            peerAddr = peerAddr.trim();
+            String[] addr = peerAddr.split(":");
+            // perform a bfs
+            Queue<String[]> next = new LinkedList<>();
+            next.add(addr);
+            while (!next.isEmpty()) {
+                addr = next.poll();
+                try {
+                    System.out.println(Arrays.toString(addr));
+                    Socket socket = new Socket(addr[0], Integer.parseInt(addr[1]));
+                    BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF8"));
+                    BufferedWriter out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF8"));
+                    out.write(handShake.toJson());
+                    out.newLine();
+                    out.flush();
+                    Document response = Document.parse(in.readLine());
+                    // connection failed
+                    log.info("receive response: " + response.toJson());
+                    if (response.getString("command").equals("CONNECTION_REFUSED")) {
+                        for (Document next_peer : (ArrayList<Document>) response.get("peers")) {
+                            String[] nextAddr = {next_peer.getString("host"), String.valueOf(next_peer.getInteger("port"))};
+                            next.add(nextAddr);
+                        }
+                        socket.close();
+                    }
+                    //
+                    else if (response.getString("command").equals("INVALID_PROTOCOL")) {
+                        log.severe("socket connect failed! Our request isn't correct: " + response.get("message"));
+                    }
+                    // connection success!
+                    else {
+                        peers.add(socket);
+                        new Connection(socket);
+                        System.out.println(peers);
+                        log.info("Successfully connect to " + Arrays.toString(addr));
+                        break;
+                    }
+
+                } catch (IOException e) {
+                    log.severe("socket connect failed!" + e.getMessage());
+                }
+            }
+        }
+    }
+
+    // handle handshake request
+    // because we will change the number of peer sockets, this method must be synchronized
+    private synchronized Document handleHandShake(String host, int port, Socket clientSocket) throws IOException {
+        Document result = new Document();
+        if (peers.size() >= Integer.parseInt(Configuration.getConfigurationValue("maximumIncommingConnections"))) {
+            result.append("command", "CONNECTION_REFUSED");
+            result.append("message", "connection limit reached");
+            ArrayList<Document> peerList = new ArrayList<>();
+            for (Socket s : peers) {
+                Document peer = new Document();
+                peer.append("host", s.getInetAddress().getHostName());
+                peer.append("port", s.getPort());
+                peerList.add(peer);
+            }
+            result.append("peers", peerList);
+            return result;
+        }
+
+        for (Socket s : peers) {
+            if (s.getInetAddress().getHostName().equals(host) && s.getPort() == port) {
+                result.append("command", "INVALID_PROTOCOL");
+                result.append("message", "Connection already established");
+                return result;
+            }
+        }
+
+        Socket persistentSocket = new Socket(host, port);
+        new Connection(persistentSocket);
+        peers.add(persistentSocket);
+        result.append("command", "HANDSHAKE_RESPONSE");
+        Document hostPort = new Document();
+        hostPort.append("host", Configuration.getConfigurationValue("advertisedName"));
+        hostPort.append("port", Integer.parseInt(Configuration.getConfigurationValue("port")));
+        result.append("hostPort", hostPort);
+
+        return result;
+    }
+
+    //###############################
+    //#   TCP server accept thread  #
+    //###############################
+    class Connection extends Thread {
+        BufferedReader in;
+        BufferedWriter out;
+        Socket clientSocket;
+        int port;
+        String host;
+        private long blockSize = Long.parseLong(Configuration.getConfigurationValue("blockSize"));
+        private Logger log = Logger.getLogger(Connection.class.getName());
+        public HashSet<String> loadingFileName;
+
+        public Connection(Socket aClientSocket) {
+            try {
+                clientSocket = aClientSocket;
+                in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), "UTF8"));
+                out = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream(), "UTF8"));
+                loadingFileName = new HashSet<>();
+                this.start();
+            } catch (IOException e) {
+                System.out.println("Connection:" + e.getMessage());
+            }
+        }
+
+        // accept request
+        public void run() {
+            // because we use persistent tcp connections, we should wait for next request
+            try {
+                while (true) {
+                    // read a line of data from the stream
+                    String dataStr = in.readLine();
+                    log.info("get message: " + dataStr);
+                    log.info(clientSocket.toString());
+                    if (dataStr == null) {
+                        clean();
+                        break;
+                    }
+                    Document data = Document.parse(dataStr);
+                    log.info(Configuration.getConfigurationValue("advertisedName") + " receive a request");
+                    if (checkField(data, "command", "", String.class)) {
+                        switch (data.getString("command")) {
+                            case "HANDSHAKE_REQUEST":
+                                // a flag to test connection is build successfully
+                                boolean connectionBuild = false;
+                                // first we check the input data and then we handle the request
+                                if (checkField(data, "hostPort", "", Document.class)) {
+                                    Document document = (Document) data.get("hostPort");
+                                    if (checkField(document, "host", "hostPort", String.class) && checkField(document, "port", "hostPort", Long.class)) {
+                                        //handle request
+                                        String host = document.getString("host");
+                                        int port = document.getInteger("port");
+                                        System.out.println(port);
+                                        Document response = ServerMain.this.handleHandShake(host, port, clientSocket);
+                                        writeToOut(response.toJson());
+                                        if (response.getString("command").equals("HANDSHAKE_RESPONSE")) {
+                                            connectionBuild = true;
+                                            this.port = port;
+                                            this.host = host;
+                                        }
+                                    }
+                                }
+                                // not build connection we should close socket
+                                if (!connectionBuild) {
+                                    clientSocket.close();
+                                    return;
+                                }
+                                break;
+                            case "FILE_CREATE_REQUEST":
+                                // first we check the input data and then we handle the request
+                                if (checkFileRequest(data)) {
+                                    data.put("command", "FILE_CREATE_RESPONSE");
+                                    Document descriptor = (Document) data.get("fileDescriptor");
+
+                                    // check if a safe path name
+                                    if (!fileSystemManager.isSafePathName(data.getString("pathName"))) {
+                                        data.append("message", "unsafe pathname given");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+                                    // check if the path exist
+                                    if (fileSystemManager.fileNameExists(data.getString("pathName"))) {
+                                        data.append("message", "pathname already exists");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+
+                                        //then check if the content exist
+                                        if(fileSystemManager.fileNameExists(data.getString("md5")))
+                                        {
+                                            data.append("message","content already exists");
+                                            data.append("status","false");
+                                            writeToOut(data.toJson());
+                                        }
+                                        break;
+                                    }
+
+
+
+                                    // check if create file is success
+                                    if (!fileSystemManager.createFileLoader(data.getString("pathName"),
+                                            descriptor.getString("md5"),
+                                            descriptor.getLong("fileSize"),
+                                            descriptor.getLong("lastModified"))) {
+                                        //not success
+                                        data.append("message", "there was a problem creating the file");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    } else {
+                                        // success! we should request file content
+                                        long size = descriptor.getLong("fileSize");
+                                        loadingFileName.add(data.getString("pathName"));
+                                        // if file size is 0, we just complete
+                                        if (size == 0) {
+                                            fileSystemManager.checkWriteComplete(data.getString("pathName"));
+                                            loadingFileName.remove(data.getString("pathName"));
+                                            data.append("message", "empty file create complete");
+                                            data.append("status", true);
+                                            writeToOut(data.toJson());
+                                        }
+                                        // if we can use short cut
+                                        else if (fileSystemManager.checkShortcut(data.getString("pathName"))) {
+                                            loadingFileName.remove(data.getString("pathName"));
+                                            data.append("message", "use short cut to create file");
+                                            data.append("status", true);
+                                            writeToOut(data.toJson());
+                                        }
+                                        // request file content
+                                        else {
+                                            System.out.println(data.toJson());
+                                            data.append("message", "file loader ready");
+                                            data.append("status", true);
+                                            writeToOut(data.toJson());
+
+                                            // send byte request
+                                            buildByteRequest(data, 0, Math.min(blockSize, descriptor.getLong("fileSize")));
+                                        }
+                                    }
+                                }
+                                break;
+                            case "FILE_CREATE_RESPONSE":
+                                // we just do nothing
+                                break;
+                            case "FILE_BYTES_REQUEST":
+                                // read file
+                                if (checkFileRequest(data)) {
+                                    if (checkField(data, "position", "", Long.class) && checkField(data, "length", "", Long.class)) {
+                                        data.put("command", "FILE_BYTES_RESPONSE");
+                                        Document fileDescriptor = (Document) data.get("fileDescriptor");
+                                        ByteBuffer byteBuffer = fileSystemManager.readFile(fileDescriptor.getString("md5"), data.getLong("position"), data.getLong("length"));
+                                        if (byteBuffer == null) {
+                                            // read failed
+                                            data.append("content", "");
+                                            data.append("message", "read failed!");
+                                            data.append("status", false);
+                                            writeToOut(data.toJson());
+                                        } else {
+                                            // read success
+                                            data.append("content", Base64.getEncoder().encodeToString(byteBuffer.array()));
+                                            data.append("message", "read success!");
+                                            data.append("status", true);
+                                            writeToOut(data.toJson());
+                                        }
+                                    }
+                                }
+                                break;
+                            case "FILE_BYTES_RESPONSE":
+                                // write file
+                                if (checkFileRequest(data)) {
+                                    if (checkField(data, "position", "", Long.class)
+                                            && checkField(data, "length", "", Long.class)
+                                            && checkField(data, "content", "", String.class)
+                                            && checkField(data, "status", "", Boolean.class)
+                                            && checkField(data, "message", "", String.class)) {
+                                        if (data.getBoolean("status")) {
+                                            Document fileDescriptor = (Document) data.get("fileDescriptor");
+                                            long size = fileDescriptor.getLong("fileSize");
+                                            long position = data.getLong("position");
+                                            long length = data.getLong("length");
+                                            ByteBuffer byteBuffer = ByteBuffer.allocate((int) length);
+                                            byteBuffer.put(Base64.getDecoder().decode(data.getString("content")));
+                                            // use this to allow channel to write
+                                            byteBuffer.position(0);
+                                            if (!fileSystemManager.writeFile(data.getString("pathName"), byteBuffer, position)) {
+                                                // write failed
+                                                log.severe("write file failed!");
+                                            } else {
+                                                // write success
+                                                if (position + length == size) {
+                                                    // write complete
+                                                    if (!fileSystemManager.checkWriteComplete(data.getString("pathName"))) {
+                                                        log.severe("write not complete!");
+                                                    }
+                                                    // cancel loading file name
+                                                    loadingFileName.remove(data.getString("pathName"));
+                                                } else {
+                                                    buildByteRequest(data, position + length, Math.min(blockSize, size - position - length));
+                                                }
+                                            }
+                                        } else {
+                                            // request is failed
+                                            log.severe("read request failed: " + data.getString("message"));
+                                        }
+                                    }
+                                }
+                                break;
+                            case "FILE_DELETE_REQUEST":
+                                // first we check the input data and then we handle the request
+                                if (checkFileRequest(data)) {
+                                    data.put("command", "FILE_DELETE_RESPONSE");
+                                    Document descriptor = (Document) data.get("fileDescriptor");
+
+                                    // check if a safe path name
+                                    if (!fileSystemManager.isSafePathName(data.getString("pathName"))) {
+                                        data.append("message", "unsafe pathname given");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+
+                                    // check if the path exist
+                                    if (!fileSystemManager.fileNameExists(data.getString("pathName"))) {
+                                        data.append("message", "pathname not exists");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+
+                                    // check if we can delete
+                                    if (!fileSystemManager.deleteFile(data.getString("pathName"),
+                                            descriptor.getLong("lastModified"),
+                                            descriptor.getString("md5"))) {
+                                        data.append("message", "there was a problem deleting the file");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    } else {
+                                        // delete complete
+                                        data.append("message", "file deleted");
+                                        data.append("status", true);
+                                        writeToOut(data.toJson());
+                                    }
+                                }
+                                break;
+                            case "FILE_DELETE_RESPONSE":
+                                // we just do nothing
+                                break;
+                            case "FILE_MODIFY_REQUEST":
+                                // first we check the input data and then we handle the request
+                                if (checkFileRequest(data)) {
+                                    data.put("command", "FILE_MODIFY_RESPONSE");
+                                    Document descriptor = (Document) data.get("fileDescriptor");
+
+                                    // check if a safe path name
+                                    if (!fileSystemManager.isSafePathName(data.getString("pathName"))) {
+                                        data.append("message", "unsafe pathname given");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+                                    // check if the path exist
+                                    if (!fileSystemManager.fileNameExists(data.getString("pathName"))) {
+                                        data.append("message", "pathname not exists");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+
+                                    // check if create file is success
+                                    if (!fileSystemManager.modifyFileLoader(data.getString("pathName"),
+                                            descriptor.getString("md5"),
+                                            descriptor.getLong("lastModified"))) {
+                                        //not success
+                                        data.append("message", "there was a problem modifying the file");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    } else {
+                                        // success! we should request file content
+                                        long size = descriptor.getLong("fileSize");
+                                        loadingFileName.add(data.getString("pathName"));
+                                        // if file size is 0, we just complete
+
+                                        if (size == 0) {
+                                            fileSystemManager.checkWriteComplete(data.getString("pathName"));
+                                            loadingFileName.remove(data.getString("pathName"));
+                                            data.append("message", "empty file modify complete");
+                                            data.append("status", true);
+                                            writeToOut(data.toJson());
+                                        }
+                                        // if data already exist
+                                        else if (fileSystemManager.checkShortcut(data.getString("pathName"))) {
+                                            loadingFileName.remove(data.getString("pathName"));
+                                            data.append("message", "file already exists with matching content");
+                                            data.append("status", true);
+                                            writeToOut(data.toJson());
+                                        }
+                                        // request file content
+                                        else {
+                                            System.out.println(data.toJson());
+                                            data.append("message", "file loader ready");
+                                            data.append("status", true);
+                                            writeToOut(data.toJson());
+
+                                            // send byte request
+                                            buildByteRequest(data, 0, Math.min(blockSize, descriptor.getLong("fileSize")));
+                                        }
+                                    }
+                                }
+                                break;
+                            case "FILE_MODIFY_RESPONSE":
+                                // we just do nothing
+                                break;
+                            case "DIRECTORY_CREATE_REQUEST":
+                                // first we check the input data and then we handle the request
+                                if (checkField(data, "pathName", "", String.class)) {
+                                    data.put("command", "DIRECTORY_CREATE_RESPONSE");
+
+                                    // check if a safe path name
+                                    if (!fileSystemManager.isSafePathName(data.getString("pathName"))) {
+                                        data.append("message", "unsafe pathname given");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+
+                                    // check if the path exist
+                                    if (fileSystemManager.dirNameExists(data.getString("pathName"))) {
+                                        data.append("message", "pathname already exists");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+
+                                    if (!fileSystemManager.makeDirectory(data.getString("pathName"))) {
+                                        // failed
+                                        data.append("message", "there was a problem creating the directory");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    } else {
+                                        // create complete
+                                        data.append("message", "directory created");
+                                        data.append("status", true);
+                                        writeToOut(data.toJson());
+                                    }
+                                }
+                                break;
+                            case "DIRECTORY_CREATE_RESPONSE":
+                                // we just do nothing
+                                break;
+                            case "DIRECTORY_DELETE_REQUEST":
+                                // first we check the input data and then we handle the request
+                                if (checkField(data, "pathName", "", String.class)) {
+                                    data.put("command", "DIRECTORY_DELETE_RESPONSE");
+
+                                    // check if a safe path name
+                                    if (!fileSystemManager.isSafePathName(data.getString("pathName"))) {
+                                        data.append("message", "unsafe pathname given");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+
+                                    // check if the path exist
+                                    if (!fileSystemManager.dirNameExists(data.getString("pathName"))) {
+                                        data.append("message", "pathname not exists");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    }
+
+                                    // check if we can delete
+                                    if (!fileSystemManager.deleteDirectory(data.getString("pathName"))) {
+                                        data.append("message", "there was a problem deleting the directory");
+                                        data.append("status", false);
+                                        writeToOut(data.toJson());
+                                        break;
+                                    } else {
+                                        // delete complete
+                                        data.append("message", "directory deleted");
+                                        data.append("status", true);
+                                        writeToOut(data.toJson());
+                                    }
+                                }
+                                break;
+                            case "DIRECTORY_DELETE_RESPONSE":
+                                // we just do nothing
+                                break;
+                            case "INVALID_PROTOCOL":
+                                log.severe("our request is invalid");
+                                break;
+                            default:
+                                writeToOut(buildInvalidResponse("unknown command: " + data.getString("command")));
+                        }
+                    }
+                }
+            } catch (EOFException e) {
+                log.severe("EOF:" + e.getMessage());
+                clean();
+            } catch (IOException e) {
+                log.severe("readline:" + e.getMessage());
+                clean();
+            } catch (NoSuchAlgorithmException e) {
+                log.severe("No such algorithm! " + e.getMessage());
+                clean();
+            }
+        }
+
+        // do some clean work
+        private void clean(){
+            // close socket
+            for (int i = 0; i < peers.size(); i++) {
+                Socket s = peers.get(i);
+                if (s.getInetAddress().getHostName().equals(host) && s.getPort() == port) {
+                    try {
+                        s.close();
+                        clientSocket.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                    peers.remove(i);
+                }
+            }
+            // clean file
+            for(String pathName : loadingFileName){
+                try {
+                    fileSystemManager.cancelFileLoader(pathName);
+                } catch (IOException e) {
+                    log.severe(e.getMessage());
+                }
+            }
+
+            log.info("connection lost " + clientSocket.toString() + " socket has closed and loading file canceled");
+        }
+
+        // build and send byte request
+        private void buildByteRequest(Document fileBasic, long position, long length) throws IOException {
+            Document request = new Document();
+            request.append("command", "FILE_BYTES_REQUEST");
+            request.append("fileDescriptor", (Document) fileBasic.get("fileDescriptor"));
+            request.append("pathName", fileBasic.getString("pathName"));
+            request.append("position", position);
+            request.append("length", length);
+
+            writeToOut(request.toJson());
+        }
+
+        // write response to out
+        private void writeToOut(String result) throws IOException {
+            log.info("write out: " + result);
+            out.write(result);
+            out.newLine();
+            out.flush();
+        }
+
+        // build invalid response with message
+        private String buildInvalidResponse(String message) {
+            Document response = new Document();
+            response.append("command", "INVALID_PROTOCOL");
+            response.append("message", message);
+            return response.toJson();
+        }
+
+        // check file request is correct
+        private boolean checkFileRequest(Document data) throws IOException {
+            if (checkField(data, "pathName", "", String.class) && checkField(data, "fileDescriptor", "", Document.class)) {
+                Document descriptor = (Document) data.get("fileDescriptor");
+                return checkField(descriptor, "md5", "", String.class) && checkField(descriptor, "lastModified", "", Long.class) && checkField(descriptor, "fileSize", "", Long.class);
+            }
+
+            return false;
+        }
+
+        // check list field and type
+        private boolean checkList(Document document, String key, String prifix, Class c) throws IOException {
+            if (!document.containsKey(key)) {
+                writeToOut(buildInvalidResponse("message must contain a field called: " + prifix + "." + key));
+
+                return false;
+            }
+            List l = new ArrayList();
+            try {
+                l = (ArrayList) document.get(key);
+            } catch (ClassCastException e) {
+                writeToOut(buildInvalidResponse("message must contain a list field called: " + prifix + "." + key));
+                return false;
+            }
+
+            if (!l.isEmpty()) {
+                try {
+                    c.cast(l.get(0));
+                } catch (ClassCastException e) {
+                    writeToOut(buildInvalidResponse("message must contain a list field contains" + c.getName() + " called: " + prifix + "." + key));
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // check the field exist and type
+        private boolean checkField(Document document, String key, String prifix, Class c) throws IOException {
+            if (!document.containsKey(key)) {
+                writeToOut(buildInvalidResponse("message must contain a field called: " + prifix + "." + key));
+
+                return false;
+            }
+            try {
+                c.cast(document.get(key));
+            } catch (ClassCastException e) {
+                writeToOut(buildInvalidResponse("message must contain a " + c.getName() + " field called: " + prifix + "." + key));
+                return false;
+            }
+
+            return true;
+        }
+    }
+}
