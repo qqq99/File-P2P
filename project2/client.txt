@@ -1,0 +1,59 @@
+# change the content of configuration.properties as following:
+path = share1
+port = 9000
+advertisedName = localhost
+peers = none
+maximumIncommingConnections = 10
+blockSize = 1
+syncInterval = 60
+
+udpPort = 10001
+mod = tcp
+timeout = 5
+retry = 3
+
+clientPort=11000
+authorized_keys=ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCymM7yjAoXWqlMoNvrAYU2PjOWaLDDFYZt51f1VjaWq4oelhYwH02SLeZ6rBUSAbyjxdFCsJ9Tzc/VEbZCtv8eRXWJWPvNrraSlA1c1u8zqI06XboLi6UoUGJ4lVI0+Y/3ljkyiQc+/se/B8ywD5+IOZ6a9sdY+I4P+BP6i74W+zvEp3czmdxpRVIq0bv0u7jWTBhcnYyohgxMQgObdLS2zBwju+nVh+y2zzPBMIx1FRy1rrMocsifExkII1Ll6xNllfQsRpCvr/q2tQjs9FgV7WqDQt8r+uh/aN/GvZA+6yy1CYofIocLWreIOaVTrEjJcVDnli9XwXIyVky1NmeN aaron@krusty
+
+# run the bitbox using:
+java -cp bitbox.jar unimelb.bitbox.Peer
+
+# change the content of configuration.properties as following:
+path = share2
+port = 9001
+advertisedName = localhost
+peers = localhost:9000
+maximumIncommingConnections = 10
+blockSize = 1
+syncInterval = 60
+
+udpPort = 10001
+mod = tcp
+timeout = 5
+retry = 3
+
+clientPort=11001
+authorized_keys=ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCymM7yjAoXWqlMoNvrAYU2PjOWaLDDFYZt51f1VjaWq4oelhYwH02SLeZ6rBUSAbyjxdFCsJ9Tzc/VEbZCtv8eRXWJWPvNrraSlA1c1u8zqI06XboLi6UoUGJ4lVI0+Y/3ljkyiQc+/se/B8ywD5+IOZ6a9sdY+I4P+BP6i74W+zvEp3czmdxpRVIq0bv0u7jWTBhcnYyohgxMQgObdLS2zBwju+nVh+y2zzPBMIx1FRy1rrMocsifExkII1Ll6xNllfQsRpCvr/q2tQjs9FgV7WqDQt8r+uh/aN/GvZA+6yy1CYofIocLWreIOaVTrEjJcVDnli9XwXIyVky1NmeN aaron@krusty
+
+# run the bitbox using:
+java -cp bitbox.jar unimelb.bitbox.Peer
+
+# change content in share1 and share2, they are synchronized
+
+# then use this command to see the peer on localhost:9000 (1st)
+java -cp bitbox.jar unimelb.bitbox.Client -c list_peers -s localhost:11000
+
+# then use this command to disconnect them
+java -cp bitbox.jar unimelb.bitbox.Client -c disconnect_peer -s localhost:11000 -p localhost:9000
+
+# then use this command to see the peer on localhost:9000 (1st)
+java -cp bitbox.jar unimelb.bitbox.Client -c list_peers -s localhost:11000
+
+# then use this command to reconnect them
+java -cp bitbox.jar unimelb.bitbox.Client -c connect_peer -s localhost:11000 -p localhost:9001
+
+# then use this command to see the peer on localhost:9000 (1st)
+java -cp bitbox.jar unimelb.bitbox.Client -c list_peers -s localhost:11000
+
+# change content in share1 and share2, they are synchronized
+
