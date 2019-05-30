@@ -1,11 +1,11 @@
 package unimelb.bitbox.util;
 
-import java.util.ArrayList;
-
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
 import org.json.simple.parser.ParseException;
+
+import java.util.ArrayList;
 
 /**
  * Helper class for using JSON. Example usage:
@@ -40,6 +40,10 @@ public class Document {
 	
 	public Document(JSONObject obj){
 		this.obj = obj;
+	}
+
+	public void put(String key, Object val){
+		obj.put(key, val);
 	}
 	
 	@SuppressWarnings("unchecked")
@@ -135,7 +139,7 @@ public class Document {
 	}
 	
 	public int getInteger(String key){
-		return (int) obj.get(key);
+		return (int) (long) obj.get(key);
 	}
 	
 	public long getLong(String key){
