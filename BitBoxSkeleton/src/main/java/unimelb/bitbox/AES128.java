@@ -59,7 +59,7 @@ public class AES128 {
         try {  
             SecureRandom secureRandom = SecureRandom.getInstance("SHA1PRNG");  
             secureRandom.setSeed(keySeed.getBytes());  
-            KeyGenerator generator = KeyGenerator.getInstance("AES");  
+            KeyGenerator generator = KeyGenerator.getInstance("AES/ECB/PKCS5Padding");  
             generator.init(secureRandom);  
             return (Key) generator.generateKey();  
         } catch (Exception e) {  
